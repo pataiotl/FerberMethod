@@ -1,8 +1,9 @@
 import streamlit as st
 import json
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import pandas as pd
 
 st.set_page_config(
@@ -24,7 +25,18 @@ FERBER_CHART = {
 }
 
 CHECK_DURATION_SECONDS = 2 * 60
+FIRST_FEED_WAIT_SECONDS = 5 * 60 * 60
+NEXT_FEED_WAIT_SECONDS = 3 * 60 * 60
 LOG_FILE = Path(__file__).with_name("sleep_log.json")
+BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
+
+
+def now_bangkok():
+    return datetime.now(BANGKOK_TZ)
+
+
+def today_bangkok():
+    return now_bangkok().date()
 
 
 def load_logs():
@@ -146,6 +158,8 @@ defaults = {
     "bedtime_start": None,
     "crying_started_at": None,
     "session_start": None,     # legacy name, migrated to crying_started_at below
+    "feeding_method_start": None,
+    "feeding_records": [],
     "wake_count": 0,
     "logs": load_logs(),       # list of dicts {date, bedtime, sleep_min, wakeups, crying_min, notes}
     "session_crying_seconds": 0,
@@ -177,7 +191,7 @@ def elapsed_now():
         return st.session_state.elapsed_seconds + (time.time() - st.session_state.timer_start)
     return st.session_state.elapsed_seconds
 
-def reset_sleep_session(reset_bedtime=False):
+def reset_sleep_session(reset_bedtime=False, reset_feeding=False):
     st.session_state.timer_running = False
     st.session_state.timer_start = None
     st.session_state.timer_mode = "wait"
@@ -189,6 +203,9 @@ def reset_sleep_session(reset_bedtime=False):
     st.session_state.wake_count = 0
     if reset_bedtime:
         st.session_state.bedtime_start = None
+    if reset_feeding:
+        st.session_state.feeding_method_start = None
+        st.session_state.feeding_records = []
 
 def add_log_entry(entry):
     st.session_state.logs.append(entry)
@@ -197,13 +214,18 @@ def add_log_entry(entry):
 def set_status(message):
     st.session_state.status_message = message
 
-def begin_check_in():
-    now = datetime.now()
+def start_method_clock(now):
     if st.session_state.bedtime_start is None:
         st.session_state.bedtime_start = now
     if st.session_state.crying_started_at is None:
         st.session_state.crying_started_at = now
         st.session_state.session_start = now
+    if st.session_state.feeding_method_start is None:
+        st.session_state.feeding_method_start = now
+
+def begin_check_in():
+    now = now_bangkok()
+    start_method_clock(now)
     st.session_state.session_crying_seconds += elapsed_now()
     st.session_state.timer_mode = "check"
     st.session_state.elapsed_seconds = 0
@@ -217,6 +239,36 @@ def finish_check_in():
     st.session_state.elapsed_seconds = 0
     st.session_state.timer_running = True
     st.session_state.timer_start = time.time()
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def next_feed_due():
+    method_start = st.session_state.feeding_method_start
+    if method_start is None:
+        return None, "1st feed"
+
+    feed_count = len(st.session_state.feeding_records)
+    if feed_count == 0:
+        return method_start + timedelta(seconds=FIRST_FEED_WAIT_SECONDS), "1st feed"
+
+    last_feed_iso = st.session_state.feeding_records[-1].get("iso_time")
+    try:
+        last_feed_time = datetime.fromisoformat(last_feed_iso)
+    except (TypeError, ValueError):
+        last_feed_time = now_bangkok()
+    if last_feed_time.tzinfo is None:
+        last_feed_time = last_feed_time.replace(tzinfo=BANGKOK_TZ)
+    return last_feed_time + timedelta(seconds=NEXT_FEED_WAIT_SECONDS), f"Feed #{feed_count + 1}"
+
+def feeding_summary():
+    records = st.session_state.feeding_records
+    total_oz = sum(float(feed.get("oz", 0) or 0) for feed in records)
+    summary = ", ".join(f"{feed.get('time', '—')} ({float(feed.get('oz', 0) or 0):g} oz)" for feed in records)
+    return len(records), total_oz, summary
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HEADER
@@ -239,7 +291,7 @@ with tabs[0]:
     with bedtime_cols[0]:
         if st.session_state.bedtime_start:
             st.markdown(
-                f"<div class='success-box'>🌙 Night started at <strong>{st.session_state.bedtime_start.strftime('%H:%M')}</strong></div>",
+                f"<div class='success-box'>🌙 Night started at <strong>{st.session_state.bedtime_start.strftime('%H:%M')}</strong> Bangkok time</div>",
                 unsafe_allow_html=True,
             )
         else:
@@ -249,10 +301,10 @@ with tabs[0]:
             )
     with bedtime_cols[1]:
         if st.button("Set Bedtime", type="secondary"):
-            st.session_state.bedtime_start = datetime.now()
+            st.session_state.bedtime_start = now_bangkok()
             st.rerun()
         if st.button("Reset Night", type="secondary"):
-            reset_sleep_session(reset_bedtime=True)
+            reset_sleep_session(reset_bedtime=True, reset_feeding=True)
             st.rerun()
 
     # Day selector
@@ -303,12 +355,8 @@ with tabs[0]:
             if st.button("▶ Start", type="primary"):
                 st.session_state.timer_running = True
                 st.session_state.timer_start = time.time()
-                now = datetime.now()
-                if st.session_state.bedtime_start is None:
-                    st.session_state.bedtime_start = now
-                if st.session_state.crying_started_at is None:
-                    st.session_state.crying_started_at = now
-                    st.session_state.session_start = now
+                now = now_bangkok()
+                start_method_clock(now)
                 st.rerun()
         else:
             if st.button("⏸ Pause", type="primary"):
@@ -328,7 +376,7 @@ with tabs[0]:
 
     with c3:
         if st.button("🌙 Asleep!", type="secondary"):
-            now = datetime.now()
+            now = now_bangkok()
             session_start = st.session_state.bedtime_start or st.session_state.crying_started_at
             sleep_min = 0
             if session_start:
@@ -336,20 +384,24 @@ with tabs[0]:
                 sleep_min = int(delta.total_seconds() / 60)
             st.session_state.session_crying_seconds += elapsed_now()
             crying_min = int(st.session_state.session_crying_seconds / 60)
+            feed_count, total_feed_oz, feed_summary = feeding_summary()
             # Auto-log entry
             entry = {
-                "date": date.today().isoformat(),
+                "date": today_bangkok().isoformat(),
                 "bedtime": st.session_state.bedtime_start.strftime("%H:%M") if st.session_state.bedtime_start else "—",
                 "crying_started": st.session_state.crying_started_at.strftime("%H:%M") if st.session_state.crying_started_at else "—",
                 "asleep_time": now.strftime("%H:%M"),
                 "sleep_min": sleep_min,
                 "wakeups": st.session_state.wake_count,
                 "crying_min": crying_min,
+                "feeds": feed_count,
+                "feed_oz_total": round(total_feed_oz, 2),
+                "feed_details": feed_summary,
                 "day": day,
                 "notes": "",
             }
             add_log_entry(entry)
-            reset_sleep_session(reset_bedtime=True)
+            reset_sleep_session(reset_bedtime=False)
             set_status(f"🎉 Baby asleep! Took {sleep_min} min. Logged automatically.")
             st.rerun()
 
@@ -372,23 +424,73 @@ with tabs[0]:
 
     # 5-3-3 Night Feeding Guide
     st.markdown("---")
-    if st.session_state.bedtime_start:
-        elapsed_session_min = (datetime.now() - st.session_state.bedtime_start).total_seconds() / 60
-        st.markdown("### 🍼 Night Feeding Window (5-3-3 Rule)")
-        if elapsed_session_min < 300:
-            mins_left = int(300 - elapsed_session_min)
-            st.markdown(f"<div class='warn-box'>⛔ <strong>No feeding yet.</strong> Focus on self-soothing. {mins_left} min until feeding window opens.</div>", unsafe_allow_html=True)
-        elif elapsed_session_min < 480:
-            st.markdown("<div class='success-box'>✅ <strong>Feeding window 1 open.</strong> Offer milk if baby woke up.</div>", unsafe_allow_html=True)
+    feeding_countdown_active = False
+    st.markdown("### 🍼 Night Feeding Timer (5-3-3 Rule)")
+    if st.session_state.feeding_method_start:
+        now = now_bangkok()
+        due_time, feed_label = next_feed_due()
+        remaining_feed_seconds = (due_time - now).total_seconds()
+        feeding_countdown_active = remaining_feed_seconds > 0
+        feed_count, total_feed_oz, feed_summary = feeding_summary()
+        window_seconds = FIRST_FEED_WAIT_SECONDS if feed_count == 0 else NEXT_FEED_WAIT_SECONDS
+        feed_progress = min(max(1 - (remaining_feed_seconds / window_seconds), 0), 1)
+
+        st.markdown(
+            f"<p style='color:#94a3b8;font-size:0.85rem;'>First feed timer started at <strong>{st.session_state.feeding_method_start.strftime('%H:%M')}</strong> Bangkok time when the method started.</p>",
+            unsafe_allow_html=True,
+        )
+
+        if remaining_feed_seconds > 0:
+            st.markdown(
+                f"<div class='warn-box'>⛔ <strong>{feed_label} not yet.</strong> Opens in {format_duration(remaining_feed_seconds)}.</div>",
+                unsafe_allow_html=True,
+            )
         else:
-            st.markdown("<div class='success-box'>✅ <strong>Feeding window 2 open.</strong> Offer milk for second wake-up if needed.</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div class='success-box'>✅ <strong>{feed_label} window open.</strong> Offer milk if baby woke up.</div>",
+                unsafe_allow_html=True,
+            )
+        st.progress(feed_progress)
+
+        feed_cols = st.columns([2, 1])
+        with feed_cols[0]:
+            feed_oz = st.number_input(
+                "Volume this feed (oz)",
+                min_value=0.0,
+                max_value=16.0,
+                value=4.0,
+                step=0.25,
+                format="%.2f",
+                key="feed_oz",
+            )
+        with feed_cols[1]:
+            if st.button("Log Feed", type="primary"):
+                if feed_oz <= 0:
+                    st.error("Enter the amount in oz before logging.")
+                else:
+                    feed_time = now_bangkok()
+                    st.session_state.feeding_records.append({
+                        "iso_time": feed_time.isoformat(),
+                        "time": feed_time.strftime("%H:%M"),
+                        "oz": round(float(feed_oz), 2),
+                    })
+                    set_status(f"Logged {feed_oz:g} oz feed.")
+                    st.rerun()
+
+        st.metric("Total Tonight", f"{total_feed_oz:g} oz", f"{feed_count} feed(s)")
+        if feed_summary:
+            st.markdown(f"<p style='color:#94a3b8;font-size:0.85rem;'>Feeds: {feed_summary}</p>", unsafe_allow_html=True)
+        if st.session_state.feeding_records and st.button("Undo Last Feed"):
+            st.session_state.feeding_records.pop()
+            set_status("Last feed removed.")
+            st.rerun()
     else:
-        st.markdown("### 🍼 Night Feeding Window (5-3-3 Rule)")
-        st.markdown("<p style='color:#94a3b8;font-size:0.85rem;'>Set bedtime to see feeding guidance.</p>", unsafe_allow_html=True)
+        st.markdown("<p style='color:#94a3b8;font-size:0.85rem;'>Press ▶ Start when you begin the method. The first feeding timer will count 5 hours from that moment.</p>", unsafe_allow_html=True)
 
     # Auto-refresh while timer is running
-    if st.session_state.timer_running:
-        time.sleep(1)
+    if st.session_state.timer_running or feeding_countdown_active:
+        refresh_delay = 1 if st.session_state.timer_running or (feeding_countdown_active and remaining_feed_seconds <= 600) else 30
+        time.sleep(refresh_delay)
         st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -436,13 +538,16 @@ with tabs[2]:
 
     # Manual entry form
     with st.expander("➕ Add Manual Entry", expanded=False):
-        log_date = st.date_input("Date", value=date.today(), key="log_date")
+        log_date = st.date_input("Date", value=today_bangkok(), key="log_date")
         log_bedtime = st.text_input("Bedtime (HH:MM)", value="20:00", key="log_bedtime")
         log_crying_started = st.text_input("Crying started (HH:MM)", value="", key="log_crying_started")
         log_asleep_time = st.text_input("Asleep time (HH:MM)", value="", key="log_asleep_time")
         log_sleep = st.number_input("Minutes to fall asleep", min_value=0, max_value=180, value=20, key="log_sleep")
         log_wakeups = st.number_input("Night wake-ups", min_value=0, max_value=20, value=0, key="log_wakeups")
         log_crying = st.number_input("Total crying (min)", min_value=0, max_value=300, value=0, key="log_crying")
+        log_feeds = st.number_input("Feeds", min_value=0, max_value=10, value=0, key="log_feeds")
+        log_feed_oz_total = st.number_input("Total feeding volume (oz)", min_value=0.0, max_value=80.0, value=0.0, step=0.25, format="%.2f", key="log_feed_oz_total")
+        log_feed_details = st.text_input("Feed details", placeholder="01:10 (4 oz), 04:30 (3 oz)", key="log_feed_details")
         log_day = st.slider("Training day", 1, 7, st.session_state.current_day, key="log_day_slider")
         log_flags = st.multiselect(
             "Context",
@@ -460,6 +565,9 @@ with tabs[2]:
                 "sleep_min": log_sleep,
                 "wakeups": log_wakeups,
                 "crying_min": log_crying,
+                "feeds": log_feeds,
+                "feed_oz_total": round(float(log_feed_oz_total), 2),
+                "feed_details": log_feed_details,
                 "day": log_day,
                 "flags": ", ".join(log_flags),
                 "notes": log_notes,
@@ -492,7 +600,7 @@ with tabs[2]:
     else:
         logs = st.session_state.logs
         df_log = pd.DataFrame(logs)
-        for numeric_col in ["sleep_min", "wakeups", "crying_min"]:
+        for numeric_col in ["sleep_min", "wakeups", "crying_min", "feeds", "feed_oz_total"]:
             if numeric_col not in df_log:
                 df_log[numeric_col] = 0
             df_log[numeric_col] = pd.to_numeric(df_log[numeric_col], errors="coerce").fillna(0)
@@ -500,10 +608,11 @@ with tabs[2]:
             df_log["date"] = ""
 
         # Summary metrics
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Avg. Sleep Time", f"{df_log['sleep_min'].mean():.0f} min")
         m2.metric("Avg. Wake-ups", f"{df_log['wakeups'].mean():.1f}")
         m3.metric("Avg. Crying", f"{df_log['crying_min'].mean():.0f} min")
+        m4.metric("Avg. Feeding", f"{df_log['feed_oz_total'].mean():.1f} oz")
 
         export_cols = st.columns(2)
         with export_cols[0]:
@@ -531,9 +640,9 @@ with tabs[2]:
 
         # Table
         st.markdown("#### All Entries")
-        display_columns = ["date", "bedtime", "crying_started", "asleep_time", "sleep_min", "wakeups", "crying_min", "day", "flags", "notes"]
+        display_columns = ["date", "bedtime", "crying_started", "asleep_time", "sleep_min", "wakeups", "crying_min", "feeds", "feed_oz_total", "feed_details", "day", "flags", "notes"]
         display_df = df_log.reindex(columns=display_columns).fillna("").copy()
-        display_df.columns = ["Date", "Bedtime", "Crying Started", "Asleep", "Sleep (min)", "Wake-ups", "Crying (min)", "Day", "Context", "Notes"]
+        display_df.columns = ["Date", "Bedtime", "Crying Started", "Asleep", "Sleep (min)", "Wake-ups", "Crying (min)", "Feeds", "Oz Total", "Feed Details", "Day", "Context", "Notes"]
         st.dataframe(display_df, use_container_width=True)
 
         # Delete last entry
@@ -565,7 +674,7 @@ with tabs[3]:
     <div class='card'>
     <span class='step-pill'>Step 1</span><br>
     <strong>Put Down Drowsy but Awake</strong><br>
-    Place baby in crib while still awake, tap Set Bedtime, say goodnight, and leave immediately.
+    Place baby in crib while still awake, tap Set Bedtime, say goodnight, and leave immediately. Times are saved in Bangkok time.
     </div>
 
     <div class='card'>
@@ -596,9 +705,9 @@ with tabs[3]:
     st.markdown("### 🍼 The 5-3-3 Night Feeding Rule")
     st.markdown("""
     <div class='card'>
-    <b>First 5 hours after bedtime</b> → No feeding. Focus on self-soothing.<br><br>
-    <b>Next 3 hours</b> → Can feed if baby wakes.<br><br>
-    <b>Last 3 hours</b> → Can feed for a second wake-up if needed.
+    <b>First 5 hours after starting the method</b> → No feeding. Focus on self-soothing.<br><br>
+    <b>After a feed</b> → The next feeding timer counts 3 hours from that feed.<br><br>
+    <b>Volume</b> → Log each feed in ounces so the night total is saved with the sleep log.
     </div>
     """, unsafe_allow_html=True)
 
