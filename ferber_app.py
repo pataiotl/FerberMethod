@@ -3,8 +3,10 @@ import json
 import time
 from datetime import datetime, date, timedelta
 from pathlib import Path
+from threading import Lock
 from zoneinfo import ZoneInfo
 import pandas as pd
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(
     page_title="Ferber Sleep Trainer",
@@ -28,6 +30,7 @@ CHECK_DURATION_SECONDS = 2 * 60
 FIRST_FEED_WAIT_SECONDS = 5 * 60 * 60
 NEXT_FEED_WAIT_SECONDS = 3 * 60 * 60
 LOG_FILE = Path(__file__).with_name("sleep_log.json")
+LOG_LOCK = Lock()
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
 
 
@@ -50,10 +53,19 @@ def load_logs():
 
 
 def save_logs():
-    LOG_FILE.write_text(
-        json.dumps(st.session_state.logs, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    payload = json.dumps(st.session_state.logs, ensure_ascii=False, indent=2)
+    temp_file = LOG_FILE.with_suffix(".tmp")
+    temp_file.write_text(payload, encoding="utf-8")
+    temp_file.replace(LOG_FILE)
+
+
+def merge_logs_for_save(new_entry=None):
+    with LOG_LOCK:
+        current_logs = load_logs()
+        if new_entry is not None:
+            current_logs.append(new_entry)
+        st.session_state.logs = current_logs
+        save_logs()
 
 # ── Custom CSS (iPhone-friendly) ────────────────────────────────────────────
 st.markdown("""
@@ -232,8 +244,7 @@ def reset_sleep_session(reset_bedtime=False, reset_feeding=False):
         st.session_state.feeding_records = []
 
 def add_log_entry(entry):
-    st.session_state.logs.append(entry)
-    save_logs()
+    merge_logs_for_save(entry)
 
 def set_status(message):
     st.session_state.status_message = message
@@ -506,8 +517,7 @@ with tabs[0]:
     # Auto-refresh while timer is running
     if st.session_state.timer_running or feeding_countdown_active:
         refresh_delay = 1 if st.session_state.timer_running or (feeding_countdown_active and remaining_feed_seconds <= 600) else 30
-        time.sleep(refresh_delay)
-        st.rerun()
+        st_autorefresh(interval=refresh_delay * 1000, key="timer_refresh")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TAB 2 – SCHEDULE
@@ -604,7 +614,8 @@ with tabs[2]:
                 else:
                     if isinstance(restored_logs, list) and all(isinstance(item, dict) for item in restored_logs):
                         st.session_state.logs = restored_logs
-                        save_logs()
+                        with LOG_LOCK:
+                            save_logs()
                         st.session_state.confirm_delete_last = False
                         set_status("Backup restored.")
                         st.rerun()
@@ -693,8 +704,11 @@ with tabs[2]:
             del_cols = st.columns(2)
             with del_cols[0]:
                 if st.button("Yes, delete", type="primary"):
-                    st.session_state.logs.pop()
-                    save_logs()
+                    with LOG_LOCK:
+                        st.session_state.logs = load_logs()
+                        if st.session_state.logs:
+                            st.session_state.logs.pop()
+                        save_logs()
                     st.session_state.confirm_delete_last = False
                     set_status("Last entry deleted.")
                     st.rerun()
